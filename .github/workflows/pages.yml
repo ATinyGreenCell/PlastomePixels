@@ -1,0 +1,60 @@
+# Builds the app and publishes it on GitHub Pages whenever main changes.
+# Turn on once with: ppx web   (or ppx init, which also creates the repository)
+#
+# Hardened like LowPingNews: each job holds only the rights it needs - the build
+# job can read the repository and nothing more; only the deploy job may publish.
+# Every action is pinned to an exact commit (its version in the comment), so a
+# moved tag cannot swap code. A failing test stops the publish.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One run at a time, and the newest wins: each run publishes the whole site.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+      - name: Install the build tools (esbuild, TypeScript; versions locked)
+        run: npm ci --no-audit --no-fund
+      - name: Type-check and test
+        run: |
+          npx tsc -p tsconfig.json
+          npx tsc -p tsconfig.sw.json
+          npm test
+      - name: Build the site
+        run: node build.mjs
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b  # v5.0.0
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3.0.1
+        with:
+          path: site
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4.0.5

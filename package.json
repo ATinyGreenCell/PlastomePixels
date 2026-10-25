@@ -1,0 +1,15 @@
+{
+  "name": "plastome-pixels",
+  "private": true,
+  "description": "Genomes as columns of pixels: one pixel per base, plus dominant-base window columns.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc -p tsconfig.json && tsc -p tsconfig.sw.json",
+    "test": "esbuild test/core.test.ts --bundle --platform=node --format=esm --outfile=test/core.test.mjs --log-level=warning && node test/core.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2",
+    "typescript": "5.6.3"
+  }
+}

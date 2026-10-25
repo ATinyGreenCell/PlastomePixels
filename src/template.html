@@ -1,0 +1,478 @@
+<title>Plastome Pixels</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Genomes as columns of pixels: one pixel per base, with dominant-base window columns beside them.">
+<!--HEAD-EXTRA-->
+<style>
+/* Layout: a bench. Settings rail on the left, a dark light-box stage on the right where the plate pans
+   and zooms; on phones the stage comes first and the settings follow. */
+:root {
+  --paper: #ebefea;        /* page ground, grey with a chlorophyll cast */
+  --panel: #f7f9f6;
+  --ink: #17211a;
+  --muted: #566257;
+  --line: #c9d3c8;
+  --accent: #2b6b3e;       /* leaf green: controls and pressed states */
+  --on-accent: #ffffff;
+  --stage: #131814;        /* the viewer stays dark in both themes, like a light box */
+  --stage-2: #1b221d;
+  --stage-ink: #dfe7df;
+  --stage-muted: #8f9c91;
+  --stage-line: #2c362e;
+  --stage-accent: #8fd0a2;
+  --on-stage-accent: #0b130d;
+  --focus: #2b6b3e;
+  /* data colours: fixed, identical in both themes */
+  --base-a: #00ffff; --base-t: #ffff00; --base-c: #ff0000; --base-g: #000000; --base-n: #808080;
+  --on-light: #000000; --on-dark: #ffffff;
+  --mark-hi: #ffffff; --mark-lo: #000000;
+  --font-display: "Martian Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --font-body: "Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ruler-w: 64px;
+  --heads-h: 48px;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0d110e; --panel: #141a16; --ink: #e0e7e0; --muted: #94a196; --line: #27312a;
+    --accent: #7cc38f; --on-accent: #0b120d;
+    --stage: #080b09; --stage-2: #0f1411; --stage-ink: #dfe7df; --stage-muted: #8a978c; --stage-line: #222c25;
+    --stage-accent: #8fd0a2; --on-stage-accent: #0b130d; --focus: #7cc38f;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0d110e; --panel: #141a16; --ink: #e0e7e0; --muted: #94a196; --line: #27312a;
+  --accent: #7cc38f; --on-accent: #0b120d;
+  --stage: #080b09; --stage-2: #0f1411; --stage-ink: #dfe7df; --stage-muted: #8a978c; --stage-line: #222c25;
+  --stage-accent: #8fd0a2; --on-stage-accent: #0b130d; --focus: #7cc38f;
+  color-scheme: dark;
+}
+
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.45 var(--font-body); -webkit-text-size-adjust: 100%; }
+*, *::before, *::after { box-sizing: border-box; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.app {
+  min-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "top" "stage" "side";
+  gap: 14px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 14px 28px;
+}
+
+/* ---- header ---- */
+.top { grid-area: top; display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 10px 24px; }
+.brand h1 { margin: 0; font: 700 clamp(21px, 2.6vw, 27px)/1.1 var(--font-display); letter-spacing: -0.03em; text-wrap: balance; }
+.brand h1 .ver { font: 500 12px/1 var(--font-display); letter-spacing: 0; color: var(--muted); margin-left: 6px; vertical-align: middle; }
+.brand p { margin: 6px 0 0; color: var(--muted); font-size: 13.5px; max-width: 60ch; }
+.strip { display: block; width: 240px; max-width: 100%; height: 6px; margin-top: 9px; image-rendering: pixelated; }
+.key { display: flex; flex-wrap: wrap; gap: 6px 14px; font: 500 12px/1 var(--font-display); color: var(--muted); }
+.key span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; width: 13px; height: 13px; border-radius: 2px; box-shadow: 0 0 0 1px var(--line); }
+
+/* ---- stage ---- */
+.stage { grid-area: stage; position: relative; display: flex; flex-direction: column; min-width: 0; background: var(--stage); color: var(--stage-ink); border-radius: var(--radius); overflow: hidden; }
+.stage-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px; border-bottom: 1px solid var(--stage-line); }
+.sgroup { display: flex; align-items: center; gap: 6px; }
+.files { order: 1; }
+.zoom { order: 2; flex: 1 1 260px; min-width: 0; }
+#saveBtn { order: 3; }
+.zoom input[type=range] { flex: 1 1 auto; min-width: 60px; accent-color: var(--stage-accent); }
+.sbtn {
+  font: 700 13px/1 var(--font-body); padding: 9px 12px; min-height: 36px; border-radius: 7px; cursor: pointer;
+  background: var(--stage-2); color: var(--stage-ink); border: 1px solid var(--stage-line); touch-action: manipulation;
+}
+.sbtn:hover { border-color: var(--stage-muted); }
+.sbtn.sq { width: 36px; padding: 0; font: 500 18px/1 var(--font-display); }
+.sbtn[aria-pressed="true"] { background: var(--stage-ink); color: var(--stage); border-color: var(--stage-ink); }
+.sbtn.primary { background: var(--stage-accent); color: var(--on-stage-accent); border-color: var(--stage-accent); }
+.zoomval { min-width: 52px; text-align: right; font: 500 12px/1 var(--font-display); color: var(--stage-muted); font-variant-numeric: tabular-nums; }
+
+.viewer {
+  position: relative; height: min(68svh, 820px); min-height: 300px; overflow: auto; overscroll-behavior: contain; overflow-anchor: none;
+  touch-action: pan-x pan-y; cursor: crosshair; background: var(--stage); outline: none; -webkit-user-select: none; user-select: none;
+}
+.viewer:focus-visible { box-shadow: inset 0 0 0 2px var(--stage-accent); }
+.viewer.dragging { cursor: grabbing; }
+.sheet { position: relative; width: calc(var(--ruler-w) + var(--img-w, 0) * var(--s, 1) * 1px); }
+.heads { position: sticky; top: 0; z-index: 3; height: var(--heads-h); background: var(--stage); border-bottom: 1px solid var(--stage-line); }
+.corner {
+  position: sticky; left: 0; z-index: 2; width: var(--ruler-w); height: 100%; background: var(--stage);
+  display: flex; align-items: flex-end; justify-content: flex-end; padding: 0 9px 7px 0;
+  font: 500 10px/14px var(--font-display); color: var(--stage-muted);
+}
+.pt { position: absolute; top: 6px; height: 18px; overflow: clip; white-space: nowrap; }
+.ptl {
+  position: sticky; left: calc(var(--ruler-w) + 4px); display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+  font: 700 12px/18px var(--font-body); color: var(--stage-ink); vertical-align: top;
+}
+.ch { position: absolute; top: 29px; height: 14px; font: 500 10.5px/14px var(--font-display); color: var(--stage-muted); text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sheet.narrow .ch .u { display: none; }
+.sheet.tiny .ch { visibility: hidden; }
+.ruler { position: sticky; left: 0; z-index: 2; width: var(--ruler-w); height: calc(var(--img-h, 0) * var(--s, 1) * 1px); background: var(--stage); border-right: 1px solid var(--stage-line); contain: layout paint; }
+.tick {
+  position: absolute; right: 0; height: 14px; margin-top: -7px; display: flex; align-items: center; gap: 4px;
+  font: 400 10px/14px var(--font-display); color: var(--stage-muted); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.tick::after { content: ""; width: 7px; height: 1px; background: currentColor; }
+.plate { position: absolute; z-index: 1; left: var(--ruler-w); top: var(--heads-h); width: calc(var(--img-w, 0) * var(--s, 1) * 1px); height: calc(var(--img-h, 0) * var(--s, 1) * 1px); contain: strict; }
+.plate canvas { position: absolute; display: block; }
+.plate.px canvas { image-rendering: pixelated; }
+.marks { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; z-index: 3; }
+.marks path { fill: none; vector-effect: non-scaling-stroke; stroke-linejoin: miter; }
+.px-halo, .win-halo { stroke: var(--mark-lo); stroke-width: 3.5; }
+.px, .win { stroke: var(--mark-hi); stroke-width: 1.5; }
+.row-guide { stroke: var(--mark-hi); stroke-width: 1; stroke-dasharray: 3 4; opacity: .85; }
+.ir-halo { stroke: var(--mark-lo); stroke-width: 3; }
+.ir-line { stroke: var(--mark-hi); stroke-width: 1.25; stroke-dasharray: 6 4; }
+.labels { position: absolute; inset: 0; pointer-events: none; z-index: 4; }
+.ir-label {
+  position: absolute; transform: translate(4px, -50%); padding: 3px 6px; border-radius: 3px; white-space: nowrap;
+  font: 700 10px/1 var(--font-display); color: var(--on-light); background: var(--mark-hi); box-shadow: 0 0 0 1px var(--mark-lo);
+}
+.viewer-msg { position: absolute; inset: 50% 24px auto; transform: translateY(-50%); margin: 0 auto; text-align: center; color: var(--stage-muted); max-width: 46ch; pointer-events: none; }
+.busy-msg {
+  position: absolute; left: 50%; top: 64px; transform: translateX(-50%); z-index: 5; margin: 0; padding: 6px 6px 6px 12px; border-radius: 8px;
+  display: flex; align-items: center; gap: 10px; max-width: calc(100% - 24px);
+  background: var(--stage-ink); color: var(--stage); font-weight: 700; font-size: 13px;
+}
+.busy-msg span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.busy-msg button { font: 700 12px/1 var(--font-body); padding: 7px 10px; border-radius: 6px; border: 0; background: var(--stage); color: var(--stage-ink); cursor: pointer; }
+
+/* ---- inspector ---- */
+.inspector { position: relative; border-top: 1px solid var(--stage-line); background: var(--stage-2); padding: 10px 12px 12px; min-height: 58px; }
+.ins-empty { margin: 4px 0 0; color: var(--stage-muted); font-size: 13.5px; }
+.ins-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-right: 40px; }
+.ins-pos { font-size: 13px; color: var(--stage-muted); }
+.ins-pos .big { font: 700 18px/1 var(--font-display); color: var(--stage-ink); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.ins-meta { color: var(--stage-muted); font-size: 13px; min-width: 0; }
+.region { color: var(--stage-ink); font-weight: 700; }
+.ins-close { position: absolute; top: 8px; right: 8px; width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--stage-line); background: transparent; color: var(--stage-ink); cursor: pointer; font-size: 17px; line-height: 1; }
+.ctx { display: flex; gap: 1px; margin: 9px 0 8px; overflow-x: auto; padding: 3px 3px 4px; }
+.ctx-cell { flex: 0 0 auto; width: 15px; height: 20px; font: 700 11px/20px var(--font-display); text-align: center; }
+.ctx-cell.empty { background: transparent; }
+.ctx-cell.here { outline: 2px solid var(--stage-ink); outline-offset: 1px; position: relative; z-index: 1; }
+.ins-table-wrap { overflow-x: auto; }
+.ins-table { border-collapse: collapse; font: 12px/1.35 var(--font-display); font-variant-numeric: tabular-nums; color: var(--stage-ink); }
+.ins-table th, .ins-table td { padding: 3px 12px 3px 0; text-align: right; white-space: nowrap; font-weight: 400; }
+.ins-table thead th { color: var(--stage-muted); font-size: 10.5px; letter-spacing: .04em; border-bottom: 1px solid var(--stage-line); padding-bottom: 5px; }
+.ins-table tbody th { color: var(--stage-ink); font-weight: 700; }
+.ins-table .rng { text-align: left; color: var(--stage-muted); }
+.ins-table thead th:nth-child(2) { text-align: left; }
+.ins-table td:nth-child(3), .ins-table thead th:nth-child(3) { text-align: center; }
+.call { display: inline-block; width: 18px; height: 18px; border-radius: 3px; font: 700 11px/18px var(--font-display); text-align: center; }
+
+/* base colour chips, shared by key, context strip, calls and composition bars */
+.b0 { background: var(--base-a); color: var(--on-light); }
+.b1 { background: var(--base-t); color: var(--on-light); }
+.b2 { background: var(--base-c); color: var(--on-dark); }
+.b3 { background: var(--base-g); color: var(--on-dark); box-shadow: inset 0 0 0 1px var(--stage-line); }
+.b4 { background: var(--base-n); color: var(--on-light); }
+
+/* ---- settings ---- */
+.side { grid-area: side; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+.card h2 { margin: 0; font: 700 11px/1 var(--font-display); letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.field > label, .lbl { font-size: 13.5px; font-weight: 700; }
+.unit { font-weight: 400; color: var(--muted); }
+.hint { margin: 0; font-size: 12.5px; color: var(--muted); }
+.err { margin: 0; font-size: 12.5px; color: var(--ink); font-weight: 700; }
+.err::before { content: "! "; color: var(--base-c); }
+input[type=number], input[type=text], input[type=search], select, textarea {
+  width: 100%; min-width: 0; padding: 8px 10px; border-radius: 7px; border: 1px solid var(--line);
+  background: var(--paper); color: var(--ink); font: 14px/1.3 var(--font-display); font-variant-numeric: tabular-nums;
+}
+input[type=search] { -webkit-appearance: none; appearance: none; }
+textarea { resize: vertical; font-size: 12px; }
+input[type=color] { width: 44px; height: 34px; padding: 2px; border-radius: 7px; border: 1px solid var(--line); background: var(--paper); cursor: pointer; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.row > input[type=text], .row > input[type=search] { flex: 1 1 140px; width: auto; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.grid3 .field > label { font-size: 12.5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chipbtn {
+  font: 500 12px/1 var(--font-display); padding: 7px 10px; min-height: 30px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent; color: var(--ink);
+}
+.chipbtn:hover { border-color: var(--muted); }
+.chipbtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn { font: 700 13.5px/1 var(--font-body); padding: 10px 13px; min-height: 38px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+.btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: .55; cursor: progress; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn.ghost { background: transparent; }
+.btn.small { min-height: 32px; padding: 7px 10px; font-size: 12.5px; }
+.check { display: flex; gap: 9px; align-items: flex-start; font-size: 13.5px; cursor: pointer; }
+.check input { margin: 2px 0 0; width: 16px; height: 16px; accent-color: var(--accent); flex: none; }
+.link { color: var(--accent); font-weight: 700; font-size: 13.5px; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.num { font-family: var(--font-display); font-variant-numeric: tabular-nums; font-size: .92em; }
+
+.panels { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.panels li { padding: 11px 0; border-top: 1px solid var(--line); min-width: 0; }
+.panels li:first-child { border-top: 0; padding-top: 0; }
+.panels li.empty { color: var(--muted); }
+.pl-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.pl-name { font-weight: 700; overflow-wrap: anywhere; }
+.pl-actions { display: flex; gap: 4px; flex: none; }
+.icon { width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--ink); cursor: pointer; font: 500 14px/1 var(--font-display); }
+.icon:hover { border-color: var(--muted); }
+.pl-id, .pl-stats, .pl-struct { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.pl-comp { display: flex; height: 7px; margin: 7px 0 6px; border-radius: 2px; overflow: hidden; box-shadow: 0 0 0 1px var(--line); }
+.pl-comp .seg { flex-basis: 0; }
+.ncbi-status { color: var(--ink); }
+.hits { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; max-height: 440px; overflow-y: auto; border-top: 1px solid var(--line); }
+.hits:empty { display: none; }
+.hit { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.hit-title { font-size: 13.5px; font-weight: 700; overflow-wrap: anywhere; }
+.hit-meta { font-size: 12.5px; color: var(--muted); }
+.hit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 3px; }
+.slice { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-radius: 8px; background: var(--paper); border: 1px solid var(--line); }
+.export-size { margin: 0; font: 700 17px/1.2 var(--font-display); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+
+/* ---- overlays ---- */
+.toast {
+  position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); z-index: 60;
+  max-width: calc(100% - 32px); padding: 11px 15px; border-radius: 9px; background: var(--ink); color: var(--paper);
+  font-size: 14px; box-shadow: 0 6px 24px rgb(0 0 0 / .25);
+}
+.banner {
+  position: fixed; z-index: 70; text-align: left; cursor: pointer;
+  left: max(12px, env(safe-area-inset-left, 0px)); right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  padding: 14px 16px; border-radius: 12px; border: 0; font: 700 14.5px/1.35 var(--font-body);
+  background: var(--accent); color: var(--on-accent); box-shadow: 0 6px 24px rgb(0 0 0 / .45), 0 0 0 2px var(--paper);
+}
+.banner.quiet { background: var(--panel); color: var(--ink); font-weight: 400; border: 1px solid var(--line); }
+.drop-shade {
+  position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; padding: 24px;
+  background: color-mix(in srgb, var(--stage) 82%, transparent); color: var(--stage-ink);
+  font: 700 16px/1.4 var(--font-body); text-align: center; pointer-events: none;
+}
+.drop-shade div { border: 2px dashed var(--stage-accent); border-radius: 14px; padding: 28px 32px; }
+.imgbox {
+  position: fixed; inset: 0; z-index: 80; display: flex; flex-direction: column; gap: 12px;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+  background: var(--stage); color: var(--stage-ink);
+}
+.imgbox header { display: flex; align-items: center; gap: 12px; }
+.imgbox p { margin: 0; font-size: 14px; flex: 1 1 auto; min-width: 0; }
+.imgbox .scroll { flex: 1 1 auto; min-height: 0; overflow: auto; display: grid; place-items: start center; }
+.imgbox img { image-rendering: pixelated; max-width: none; -webkit-touch-callout: default; }
+.imgbox code { font: 12px var(--font-display); color: var(--stage-muted); overflow-wrap: anywhere; }
+
+@media (min-width: 980px) {
+  body { overflow: hidden; }
+  .app {
+    height: 100%;
+    grid-template-columns: 340px minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas: "top top" "side stage";
+    padding-block: 16px;
+  }
+  .side { min-height: 0; overflow-y: auto; padding-right: 4px; scrollbar-width: thin; }
+  .stage { min-height: 0; }
+  .viewer { height: auto; min-height: 0; flex: 1 1 0; }
+}
+@media (max-width: 620px) {
+  .brand p { display: none; }
+  .files { flex: 1 1 auto; }
+  #saveBtn { order: 2; }
+  .zoom { order: 3; flex-basis: 100%; }
+  .viewer { height: min(60svh, 820px); }
+}
+@media (max-width: 420px) {
+  .grid3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toast { animation: rise .18s ease-out; }
+  @keyframes rise { from { transform: translate(-50%, 8px); opacity: 0; } }
+}
+</style>
+<!--BODY-->
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <h1>Plastome Pixels<small class="ver" id="ver"></small></h1>
+      <p>One pixel per base, left to right in rows. The first column is every base; the others colour each window by its most common base.</p>
+      <canvas id="strip" class="strip" width="120" height="1" aria-hidden="true"></canvas>
+    </div>
+    <div class="key" aria-label="Colour key">
+      <span><i class="sw b0"></i>A</span>
+      <span><i class="sw b1"></i>T</span>
+      <span><i class="sw b2"></i>C</span>
+      <span><i class="sw b3"></i>G</span>
+      <span><i class="sw b4"></i>N / other</span>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div class="stage-bar">
+      <div class="sgroup files">
+        <button class="sbtn" id="openBtn" type="button">Open…</button>
+        <button class="sbtn" id="addBtn" type="button">Add…</button>
+      </div>
+      <div class="sgroup zoom" role="group" aria-label="Zoom">
+        <button class="sbtn" id="fitBtn" type="button" aria-pressed="true">Fit</button>
+        <button class="sbtn sq" id="zoomOutBtn" type="button" aria-label="Zoom out">−</button>
+        <input id="zoomRange" type="range" min="0" max="1000" step="1" value="500" aria-label="Zoom">
+        <button class="sbtn sq" id="zoomIn" type="button" aria-label="Zoom in">+</button>
+        <output id="zoomVal" class="zoomval">1×</output>
+      </div>
+      <button class="sbtn primary" id="saveBtn" type="button">Save PNG</button>
+      <input type="file" id="fileInput" multiple hidden>
+    </div>
+    <div class="viewer" id="viewer" tabindex="0" aria-label="Genome image. Scroll or drag to pan, pinch or use the zoom controls to zoom, tap a pixel to inspect it.">
+      <div class="sheet" id="sheet">
+        <div class="heads" id="heads"></div>
+        <div class="ruler" id="ruler"></div>
+        <div class="plate" id="plate"></div>
+      </div>
+      <p class="viewer-msg" id="viewerMsg" hidden></p>
+    </div>
+    <div class="busy-msg" id="busyMsg" role="status" hidden><span id="busyText"></span><button id="busyCancel" type="button" hidden>Cancel</button></div>
+    <div class="inspector" id="inspector" aria-live="polite"><p class="ins-empty">Tap or click any pixel to see its position, its base, and what each window column called there.</p></div>
+  </main>
+
+  <aside class="side" aria-label="Settings">
+    <section class="card" aria-labelledby="hGenomes">
+      <h2 id="hGenomes">Genomes</h2>
+      <ol class="panels" id="panelList"><li class="empty">Loading…</li></ol>
+      <form class="field" id="ncbiForm" role="search" autocomplete="off">
+        <label for="ncbiQ">Find on NCBI <span class="unit">organism name or accession</span></label>
+        <div class="row">
+          <input id="ncbiQ" type="search" placeholder="duckweed, Nicotiana tabacum, NC_000913.3" spellcheck="false" autocapitalize="off" enterkeyhint="search">
+          <button class="btn primary" id="ncbiGo" type="submit">Search</button>
+        </div>
+        <div class="chips" role="group" aria-label="Kind of record">
+          <button class="chipbtn" type="button" data-kind="plastid">Plastid</button>
+          <button class="chipbtn" type="button" data-kind="mito">Mitochondrion</button>
+          <button class="chipbtn" type="button" data-kind="plasmid">Plasmid</button>
+          <button class="chipbtn" type="button" data-kind="chromosome">Chromosome / genome</button>
+          <button class="chipbtn" type="button" data-kind="any">Any</button>
+        </div>
+        <label class="check"><input type="checkbox" id="refseq"> <span>RefSeq first (the curated reference copy)</span></label>
+      </form>
+      <p class="hint ncbi-status" id="ncbiStatus" aria-live="polite" hidden></p>
+      <div class="slice" id="sliceRow" hidden>
+        <span class="lbl">Records over 20 Mb load a slice</span>
+        <div class="grid2">
+          <div class="field"><label for="sliceFrom">From base</label><input id="sliceFrom" type="number" min="1" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="sliceLen">Length <span class="unit">bp</span></label><input id="sliceLen" type="number" min="1000" max="20000000" step="1000" inputmode="numeric"></div>
+        </div>
+      </div>
+      <ol class="hits" id="ncbiResults"></ol>
+      <div class="row"><button class="btn ghost" id="ncbiMore" type="button" hidden>More results</button></div>
+      <a id="ncbiWeb" class="link" target="_blank" rel="noopener noreferrer" href="https://www.ncbi.nlm.nih.gov/nuccore">NCBI Nucleotide ↗</a>
+      <div class="field">
+        <span class="lbl">Samples</span>
+        <div class="chips">
+          <button class="chipbtn" type="button" data-sample="arabidopsis"><i>Arabidopsis</i></button>
+          <button class="chipbtn" type="button" data-sample="amborella"><i>Amborella</i></button>
+          <button class="chipbtn" type="button" data-sample="both">Both</button>
+        </div>
+      </div>
+      <div class="field">
+        <div class="row"><button class="btn" id="pasteToggle" type="button" aria-expanded="false" aria-controls="pasteBox">Paste a sequence</button></div>
+        <div id="pasteBox" class="field" hidden>
+          <label for="pasteArea">FASTA, GenBank or plain bases</label>
+          <textarea id="pasteArea" rows="5" spellcheck="false" autocomplete="off" placeholder=">my_plastome&#10;ATGGCGACCATTAAGCAACTTATT…"></textarea>
+          <div class="row">
+            <button class="btn primary" id="pasteShow" type="button">Show</button>
+            <button class="btn" id="pasteAdd" type="button">Add beside</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="hLayout">
+      <h2 id="hLayout">Layout</h2>
+      <div class="field">
+        <label for="width">Row width <span class="unit">bp per row</span></label>
+        <input id="width" type="number" min="1" max="100000" step="1" inputmode="numeric">
+        <div class="chips" role="group" aria-label="Row width presets">
+          <button class="chipbtn" type="button" data-width="50">50</button>
+          <button class="chipbtn" type="button" data-width="100">100</button>
+          <button class="chipbtn" type="button" data-width="200">200</button>
+          <button class="chipbtn" type="button" data-width="400">400</button>
+          <button class="chipbtn" type="button" data-width="square">Square</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="windows">Columns <span class="unit">bp per call, left to right</span></label>
+        <input id="windows" type="text" inputmode="text" autocomplete="off" spellcheck="false">
+        <p class="err" id="windowsErr" hidden></p>
+        <p class="hint">1 is every base. 20 colours each run of 20 bases by its most common base, and so on.</p>
+      </div>
+      <div class="grid2">
+        <div class="field"><label for="start">From base</label><input id="start" type="number" min="1" step="1" inputmode="numeric"></div>
+        <div class="field"><label for="length">Length <span class="unit">bp</span></label><input id="length" type="number" min="0" step="1" inputmode="numeric" placeholder="whole"></div>
+      </div>
+      <div class="grid3">
+        <div class="field"><label for="gap">Column gap <span class="unit">px</span></label><input id="gap" type="number" min="0" max="500" step="1" inputmode="numeric"></div>
+        <div class="field"><label for="panelGap">Genome gap <span class="unit">px</span></label><input id="panelGap" type="number" min="0" max="2000" step="1" inputmode="numeric"></div>
+        <div class="field"><label for="margin">Margin <span class="unit">px</span></label><input id="margin" type="number" min="0" max="2000" step="1" inputmode="numeric"></div>
+      </div>
+      <div class="field">
+        <label for="bg">Background and gaps</label>
+        <div class="row">
+          <input id="bg" type="color">
+          <button class="chipbtn" type="button" data-bg="#000000">Black</button>
+          <button class="chipbtn" type="button" data-bg="#ffffff">White</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="other">N and other letters</label>
+        <div class="row"><input id="other" type="color"><span class="hint">Not counted in window calls.</span></div>
+      </div>
+      <div class="field">
+        <label for="tie">When bases tie in a window</label>
+        <select id="tie">
+          <option value="order">A wins, then T, C, G</option>
+          <option value="first">First to appear wins</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="irMarks"> <span>Mark LSC, IR and SSC boundaries in the viewer (found from the inverted repeats; never exported)</span></label>
+      <div class="row"><button class="btn ghost" id="resetBtn" type="button">Reset layout</button></div>
+    </section>
+
+    <section class="card" aria-labelledby="hExport">
+      <h2 id="hExport">Export</h2>
+      <div class="field">
+        <label for="scale">Pixels per base</label>
+        <select id="scale">
+          <option value="1">1 × 1, exact</option>
+          <option value="2">2 × 2</option>
+          <option value="3">3 × 3</option>
+          <option value="4">4 × 4</option>
+          <option value="6">6 × 6</option>
+          <option value="8">8 × 8</option>
+        </select>
+      </div>
+      <p class="export-size" id="exportSize">—</p>
+      <p class="hint" id="exportNote"></p>
+      <p class="hint">The PNG holds the image only: no labels, ruler or marks.</p>
+      <div class="row"><button class="btn primary" id="saveBtn2" type="button">Save PNG</button></div>
+    </section>
+  </aside>
+</div>
+
+<div class="drop-shade" id="dropShade" hidden><div>Drop FASTA or GenBank files to open them.<br>Hold Shift to add them beside the current genomes.</div></div>
+<div class="toast" id="toast" role="status" hidden></div>
+<button class="banner" id="update" type="button" hidden>A newer version is ready. Tap to update.</button>
+<button class="banner quiet" id="hint" type="button" hidden>To install: tap Share, then <b>Add to Home Screen</b>. (Tap to dismiss)</button>
+<div class="imgbox" id="imgBox" hidden role="dialog" aria-modal="true" aria-labelledby="imgBoxMsg">
+  <header>
+    <p id="imgBoxMsg">Press and hold the image (or right-click it) to save it. <code id="imgBoxName"></code></p>
+    <button class="sbtn" id="imgBoxClose" type="button">Close</button>
+  </header>
+  <div class="scroll"><img id="imgBoxImg" alt="Exported genome image"></div>
+</div>
+<!--SCRIPTS-->

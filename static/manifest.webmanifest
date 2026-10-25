@@ -1,0 +1,14 @@
+{
+  "name": "Plastome Pixels",
+  "short_name": "Plastome",
+  "description": "Genomes as columns of pixels: one pixel per base, with dominant-base window columns.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#131814",
+  "theme_color": "#131814",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

@@ -1,0 +1,16 @@
+node_modules/
+site/
+dist/
+.build/
+test/core.test.mjs
+test/shots/
+test/perf/*.fa
+test/perf/baseline.html
+data/sdist/
+data/pga/
+*.bak
+*.new
+.DS_Store
+test/out.png
+.ppx-synced
+.ppx-base

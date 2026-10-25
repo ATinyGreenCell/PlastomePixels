@@ -1,0 +1,597 @@
+#!/usr/bin/env sh
+# ppx - dev loop and release tool for Plastome Pixels (the GitHub Pages app).
+# Modelled on LowPingNews's lpn. Picks builds by the version inside, never by filename. A build comes in
+# as a git commit on top of the code it was made from and is merged, so git itself keeps every change
+# made here, and stops at any clash before a file is touched.
+set -u
+
+REPO="${PPX_REPO:-$HOME/PlastomePixels}"
+# Termux's share handler writes to ~/downloads; the browser writes to
+# ~/storage/downloads. Scan both or builds silently go missing.
+DLS="${PPX_DOWNLOADS:-$HOME/downloads $HOME/storage/downloads}"
+NAME="Plastome Pixels"
+WORKFLOW="pages.yml"
+SYNCED="refs/ppx/synced"      # the commit of the last build synced in
+FORCE="${PPX_FORCE:-}"
+
+die() { printf '%s\n' "ppx: $*" >&2; exit 1; }
+say() { printf '  %s\n' "$*"; }
+g() { git -C "$REPO" "$@"; }
+
+# scratch folders, all under one parent that goes on exit. Call tmpdir directly, never in $( ).
+TOP=""
+trap '[ -z "$TOP" ] || rm -rf "$TOP"' EXIT
+tmpdir() {
+  if [ -z "$TOP" ]; then TOP="$(mktemp -d 2>/dev/null || mktemp -d -t ppx)" || die "no temporary folder"; fi
+  MKT="$TOP/$1"; rm -rf "$MKT"; mkdir -p "$MKT" || die "no temporary folder"
+}
+
+# Top-level paths this project owns. Nothing else is ever extracted, committed or released.
+OWNED="src scripts static test data .github build.mjs package.json package-lock.json tsconfig.json tsconfig.sw.json README.md LICENSE .gitignore ppx install.sh"
+owned() { for o in $OWNED; do [ "$1" = "$o" ] && return 0; done; return 1; }
+# files every complete build has
+CORE="src/version.ts src/main.ts src/engine.ts src/viewer.ts build.mjs package.json package-lock.json ppx install.sh README.md .gitignore .github/workflows/pages.yml"
+
+# ---- versions ------------------------------------------------------------------------------
+
+ver_text() { sed -n 's/^export const APP_VERSION = "\([0-9][0-9.]*\)";.*$/\1/p' | head -n 1; }
+repo_ver() { [ -f "$REPO/src/version.ts" ] && ver_text < "$REPO/src/version.ts"; }
+member()   { tar tzf "$1" 2>/dev/null | grep -xF -e "$2" -e "./$2" | head -n 1; }   # its name in the archive
+tar_ver()  { _tv_m="$(member "$1" src/version.ts)"; [ -n "$_tv_m" ] && tar xzf "$1" -O "$_tv_m" 2>/dev/null | ver_text; }
+
+newer() {   # newer A B: is version A later than B? (2.10 > 2.9; no sort -V needed)
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, x, "."); m = split(b, y, "."); k = n > m ? n : m
+    for (i = 1; i <= k; i++) { d = (x[i] + 0) - (y[i] + 0); if (d > 0) exit 0; if (d < 0) exit 1 }
+    exit 1 }'
+}
+
+valid_ver() { case "$1" in ""|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac; return 0; }
+
+# ---- archives -------------------------------------------------------------------------------
+
+# 0 a complete build of this project; 1 holds something else (foreign files, links, devices, paths that
+# climb out or into .git); 2 not a whole archive; 3 only part of a build
+archive_ok() {
+  _ao_list="$(tar tzf "$1" 2>/dev/null)" || return 2
+  [ -n "$_ao_list" ] || return 2
+  tar tzvf "$1" 2>/dev/null | grep -q '^[^-d]' && return 1      # only plain files and folders
+  printf '%s\n' "$_ao_list" | {
+    while IFS= read -r m; do
+      [ "$m" = "./" ] && continue
+      m="${m#./}"
+      case "$m" in
+        ""|/*|*//*|.|./*|*/.|*/./*|..|../*|*/..|*/../*|.git|.git/*|*/.git|*/.git/*) exit 1 ;;
+        .ppx-base) continue ;;                 # the commit the build was made from (read, never kept)
+      esac
+      owned "${m%%/*}" || exit 1
+    done
+    exit 0
+  } || return 1
+  for _ao_f in $CORE; do printf '%s\n' "$_ao_list" | grep -qxF -e "$_ao_f" -e "./$_ao_f" || return 3; done
+  return 0
+}
+
+# the newest complete build in the download folders, by the version inside: "path version"
+newest_archive() {
+  best=""; bv=""
+  for d in $DLS; do
+    [ -d "$d" ] || continue
+    for t in "$d"/plastomepixels-v*.tar.gz "$d"/plastomepixels-v*.tgz; do
+      [ -f "$t" ] || continue
+      archive_ok "$t"; ok=$?
+      case $ok in
+        1) say "skipping $(basename "$t"): holds links, devices or files this project does not own" >&2; continue ;;
+        2) say "skipping $(basename "$t"): not a whole archive (download cut short?)" >&2; continue ;;
+        3) say "skipping $(basename "$t"): only part of a build" >&2; continue ;;
+      esac
+      v="$(tar_ver "$t")"
+      valid_ver "$v" || { say "skipping $(basename "$t"): no version inside" >&2; continue; }
+      # between two archives of the same version, the newer download
+      if [ -z "$best" ] || newer "$v" "$bv" || { [ "$v" = "$bv" ] && [ "$t" -nt "$best" ]; }; then best="$t"; bv="$v"; fi
+    done
+  done
+  [ -n "$best" ] && printf '%s %s\n' "$best" "$bv"
+}
+
+# ---- GitHub ---------------------------------------------------------------------------------
+
+repo_slug() {
+  [ -n "${PPX_GH_REPO:-}" ] && { printf '%s\n' "$PPX_GH_REPO"; return; }
+  g remote get-url origin 2>/dev/null | sed -n 's#.*github\.com[:/]\([^/]*/[^/]*\)$#\1#p' | sed 's#\.git$##'
+}
+
+site_url() {
+  slug="$(repo_slug)"
+  [ -n "$slug" ] || return 1
+  owner="$(printf '%s' "${slug%%/*}" | tr '[:upper:]' '[:lower:]')"
+  printf 'https://%s.github.io/%s/\n' "$owner" "${slug#*/}"
+}
+
+gh_t() {   # gh, but a weak signal cannot hold ppx for long
+  if command -v timeout >/dev/null 2>&1; then timeout 25 gh "$@"; else gh "$@"; fi
+}
+
+need_gh() { command -v gh >/dev/null 2>&1 || die "needs gh (pkg install gh), signed in: gh auth login"; }
+
+# GitHub's tag vVERSION (its object id), empty if there is none; fails when GitHub can't be reached
+remote_tag() { _rt="$(g ls-remote --tags origin "refs/tags/v$1")" || return 1; printf '%s\n' "$_rt" | awk 'NR == 1 { print $1 }'; }
+local_tag()  { g rev-parse -q --verify "refs/tags/v$1" 2>/dev/null; }
+clean_tree() { [ -z "$(g status --porcelain 2>/dev/null)" ]; }
+
+pages_on() {   # Pages built by the workflow, not from a branch (409 = already on)
+  slug="$(repo_slug)"
+  gh_t api -X POST "repos/$slug/pages" -f build_type=workflow >/dev/null 2>&1 \
+    || gh_t api -X PUT "repos/$slug/pages" -f build_type=workflow >/dev/null 2>&1 \
+    || say "(could not switch Pages on - Settings > Pages > Source: GitHub Actions)"
+}
+
+# what the live site serves, and how its last publish went
+site_status() {
+  url="$(site_url)" || { say "site       no GitHub remote yet (ppx init)"; return 0; }
+  live=""
+  if command -v curl >/dev/null 2>&1; then
+    live="$(curl -fsS --max-time 15 "${url}version.json" 2>/dev/null | sed -n 's/.*"version" *: *"\([0-9.]*\)".*/\1/p')"
+  fi
+  rv="$(repo_ver)"
+  if [ -n "$live" ]; then
+    if [ "$live" = "$rv" ]; then say "site       v$live live   $url"
+    else say "site       v$live live, repo has v$rv   $url"; fi
+  else
+    say "site       not answering (yet?)   $url"
+  fi
+  command -v gh >/dev/null 2>&1 || return 0
+  slug="$(repo_slug)"
+  run="$(gh_t run list -R "$slug" --workflow "$WORKFLOW" -L 1 --json status,conclusion,createdAt,databaseId \
+    --jq '.[0] | select(.) | [.status, (.conclusion // ""), (((now - (.createdAt | fromdateiso8601)) / 60) | floor | tostring), (.databaseId | tostring)] | join(" ")' 2>/dev/null)" \
+    || { say "           (could not read the publish runs: gh auth status)"; return 0; }
+  [ -n "$run" ] || { say "           no publish runs yet: ppx web"; return 0; }
+  set -- $run
+  st="$1"; concl="${2:-}"; mins="${3:-0}"; id="${4:-}"
+  [ "$st" = completed ] || { concl=""; mins="${2:-0}"; id="${3:-}"; }
+  case "$mins" in ""|*[!0-9]*) mins=0 ;; esac
+  if [ "$mins" -lt 60 ]; then ago="${mins}m"; elif [ "$mins" -lt 1440 ]; then ago="$((mins / 60))h"; else ago="$((mins / 1440))d"; fi
+  case "$st:$concl" in
+    completed:success) say "           last publish ${ago} ago: ok" ;;
+    completed:cancelled) say "           last publish ${ago} ago was replaced by a newer one" ;;
+    completed:*) say "           last publish ${ago} ago FAILED - why: gh run view $id -R $slug --log-failed" ;;
+    *) say "           publishing now (started ${ago} ago)" ;;
+  esac
+}
+
+# ---- commands -------------------------------------------------------------------------------
+
+cmd_status() {
+  rv="$(repo_ver)"
+  say "repo       ${rv:-none}   $REPO"
+  a="$(newest_archive 2>/dev/null || true)"
+  if [ -n "$a" ]; then
+    av="${a##* }"
+    note=""
+    [ -n "$rv" ] && newer "$av" "$rv" && note="   newer: ppx sync"
+    say "download   $av   ${a% *}$note"
+  else
+    say "download   none"
+  fi
+  if [ -d "$REPO/.git" ]; then
+    [ "${PPX_NOFETCH:-}" = "1" ] || g fetch -q origin 2>/dev/null || true
+    lh="$(g rev-parse --short HEAD 2>/dev/null || printf '?')"
+    rh="$(g rev-parse --short '@{u}' 2>/dev/null || printf '?')"
+    dirty=""; clean_tree || dirty=" (unsaved changes: ppx ship \"...\")"
+    say "git        $lh local / $rh remote$dirty"
+    site_status
+  else
+    say "git        not a repository yet: ppx init"
+  fi
+  return 0
+}
+
+install_self() {   # the ppx on your PATH follows the repo's copy
+  [ -f "$REPO/ppx" ] || return 0
+  me="$(command -v ppx 2>/dev/null || true)"
+  [ -n "$me" ] && [ -f "$me" ] || return 0
+  [ "$(cd "$(dirname "$me")" && pwd)" = "$(cd "$REPO" && pwd)" ] && return 0
+  [ "$(cksum < "$REPO/ppx")" = "$(cksum < "$me")" ] && return 0
+  sh -n "$REPO/ppx" 2>/dev/null || { say "(the repo's ppx does not check out: not installed)"; return 0; }
+  cp "$REPO/ppx" "$me.new" && chmod +x "$me.new" && mv "$me.new" "$me" && say "updated the ppx command"
+}
+
+cmd_sync() {
+  command -v git >/dev/null 2>&1 || die "needs git (pkg install git)"
+  a="$(newest_archive)" || true
+  [ -n "$a" ] || die "no complete $NAME build (plastomepixels-v*.tar.gz) in: $DLS"
+  t="${a% *}"; v="${a##* }"
+  tmpdir build; b="$MKT"
+  tar xzf "$t" -C "$b" || die "could not unpack $t"
+  base=""
+  if [ -f "$b/.ppx-base" ]; then base="$(head -n 1 "$b/.ppx-base" | tr -cd '0-9a-f')"; rm -f "$b/.ppx-base"; fi
+  tree=""
+  if [ -d "$REPO/.git" ] && g rev-parse -q --verify HEAD >/dev/null; then
+    # the build's files as a git tree (only git's object store is written to)
+    rm -f "$TOP/index"
+    (cd "$b" && GIT_INDEX_FILE="$TOP/index" git --git-dir="$REPO/.git" --work-tree=. add -A -f .) \
+      || die "could not read the build"
+    tree="$(GIT_INDEX_FILE="$TOP/index" git --git-dir="$REPO/.git" write-tree)" || die "could not read the build"
+    if [ "$tree" = "$(g rev-parse "HEAD^{tree}")" ] || [ "$tree" = "$(g rev-parse -q --verify "$SYNCED^{tree}" 2>/dev/null)" ]; then
+      say "already synced: this v$v build is here"
+      return 0
+    fi
+  fi
+  cur="$(repo_ver || true)"
+  if [ -f "$REPO/src/version.ts" ] && ! valid_ver "$cur" && [ "$FORCE" != 1 ]; then
+    die "cannot read the version in $REPO/src/version.ts; PPX_FORCE=1 ppx sync takes $(basename "$t") anyway"
+  fi
+  if [ -n "$cur" ] && newer "$cur" "$v" && [ "$FORCE" != 1 ]; then
+    die "refusing: $(basename "$t") is v$v, older than the repo's v$cur.
+  Download the current build first, or set PPX_FORCE=1 to go back."
+  fi
+
+  if [ ! -d "$REPO/.git" ]; then          # before ppx init there is nothing to protect yet
+    mkdir -p "$REPO" || die "cannot create $REPO"
+    cp -R "$b/." "$REPO/" || die "copying into $REPO failed"
+    say "synced v$v from $(basename "$t")"
+    install_self
+    say "next: ppx init   (puts it on GitHub Pages)"
+    return 0
+  fi
+  [ -n "$tree" ] || die "the repository has no commits yet: ppx init"
+
+  # 1. unsaved changes are never touched: they must be shipped (or thrown away) first
+  if ! clean_tree; then
+    die "refusing: there are unsaved changes here:
+$(g status --short | sed 's/^/    /')
+  ppx ship \"...\" keeps them (then sync again); git checkout -- . && git clean -fd throws them away."
+  fi
+
+  # 2. the build as a commit on top of the code it was made from
+  if [ -n "$base" ]; then
+    if ! g cat-file -e "$base^{commit}" 2>/dev/null; then
+      g fetch -q origin 2>/dev/null || true
+      g cat-file -e "$base^{commit}" 2>/dev/null \
+        || die "refusing: this build was made from commit $(printf '%.7s' "$base"), which isn't here or on GitHub."
+    fi
+    parent="$base"
+  else
+    parent="$(g rev-parse HEAD)"
+    synced="$(g rev-parse -q --verify "$SYNCED^{tree}" 2>/dev/null || true)"
+    if [ -z "$synced" ] || [ "$synced" != "$(g rev-parse "HEAD^{tree}")" ]; then
+      [ "$FORCE" = 1 ] || die "refusing: this build doesn't say what it was made from, and there is work here since the last sync.
+  Ask for a build made from the code on GitHub (ppx pack in a clone of it), or PPX_FORCE=1 ppx sync
+  to take it anyway (your work stays in git history)."
+      say "taking it over the work here, which stays in history: git checkout $(printf '%.7s' "$parent") -- <file> brings a file back"
+    fi
+  fi
+  bc="$(g commit-tree "$tree" -p "$parent" -m "v$v build ($(basename "$t"))")" \
+    || die "could not record the build (git config --global user.name / user.email?)"
+  gone="$(g diff --name-only --diff-filter=D "$parent" "$bc" | grep -c . || true)"
+  if [ "$gone" -gt 10 ] && [ "$FORCE" != 1 ]; then
+    die "refusing: this build drops $gone files ($(g diff --name-only --diff-filter=D "$parent" "$bc" | head -n 3 | tr '\n' ' ')...).
+  Is it a whole build? PPX_FORCE=1 ppx sync if this is right."
+  fi
+
+  # 3. merge it: git keeps the work done here and the build's changes, and stops at any clash
+  if [ "$(g rev-parse HEAD)" = "$parent" ]; then
+    g merge -q --ff-only "$bc" || die "updating the files stopped part way: git status shows where; git reset --hard undoes it"
+  elif ! g merge -q --no-ff --no-edit -m "Merge the v$v build into the work done here" "$bc" >/dev/null 2>&1; then
+    clash="$(g diff --name-only --diff-filter=U)"
+    # both sides bumping the version is no clash: the build's is newer (checked above)
+    if [ "$clash" = src/version.ts ] && g checkout -q --theirs -- src/version.ts 2>/dev/null \
+       && g add src/version.ts && g commit -q --no-edit >/dev/null 2>&1; then
+      :
+    else
+      g merge --abort 2>/dev/null || g reset -q --merge 2>/dev/null
+      hint="Ask for a build made from the code as it is on GitHub now."
+      [ -z "$(g rev-list '@{u}..HEAD' 2>/dev/null)" ] || hint="Your latest commits aren't on GitHub yet, so no build can include them: ppx ship, then ask for a new build."
+      die "refusing: this build and work done here both changed:
+$(printf '%s\n' "${clash:-(see git status)}" | sed 's/^/    /')
+  Nothing was changed. $hint"
+    fi
+  fi
+  g update-ref "$SYNCED" "$bc"
+  say "synced v$v from $(basename "$t")"
+  g diff --stat=72 "$parent" "$bc" 2>/dev/null | tail -n 1 | sed 's/^ */  /'
+  install_self
+}
+
+# type-check, test and build; prints only on failure. Returns non-zero when anything fails.
+run_tests() {
+  [ -f "$REPO/src/version.ts" ] || { say "no source in $REPO: ppx sync first"; return 1; }
+  sh -n "$REPO/ppx" || { say "ppx has a syntax error"; return 1; }
+  [ ! -f "$REPO/install.sh" ] || sh -n "$REPO/install.sh" || { say "install.sh has a syntax error"; return 1; }
+  for _t_f in $CORE; do [ -f "$REPO/$_t_f" ] || { say "missing $_t_f"; return 1; }; done
+  _t_v="$(repo_ver)"; valid_ver "$_t_v" || { say "src/version.ts has no APP_VERSION"; return 1; }
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    say "node is not installed (pkg install nodejs), so only the files were checked."
+    say "GitHub runs every test before it publishes, and a failure stops the publish."
+    return 0
+  fi
+  tmpdir test; _t_log="$MKT/test.log"
+  if ! (
+    cd "$REPO" || exit 1
+    # the build tools again only when the lockfile changed (an archive's file times can't be trusted)
+    if [ "$(cat node_modules/.ppx-lock 2>/dev/null)" != "$(cksum < package-lock.json)" ]; then
+      echo "installing the build tools"; npm ci --no-audit --no-fund || exit 1
+      cksum < package-lock.json > node_modules/.ppx-lock
+    fi
+    npx tsc -p tsconfig.json && npx tsc -p tsconfig.sw.json && npm test --silent && node build.mjs
+  ) > "$_t_log" 2>&1; then
+    tail -n 30 "$_t_log"
+    return 1
+  fi
+  _t_n="$(sed -n 's/^all \([0-9]*\) passed.*/\1/p' "$_t_log" | tail -n 1)"
+  _t_bv="$(sed -n 's/.*"version" *: *"\([0-9.]*\)".*/\1/p' "$REPO/site/version.json" 2>/dev/null)"
+  [ "$_t_bv" = "$_t_v" ] || { say "the build says v$_t_bv but the source says v$_t_v"; return 1; }
+  say "${_t_n:-all} tests passed; built v$_t_v"
+}
+cmd_test() { run_tests || die "tests failed"; }
+
+stray_check() {
+  stray="$( { g -c core.quotePath=false ls-files --others --exclude-standard
+              g -c core.quotePath=false diff --name-only HEAD 2>/dev/null
+              g -c core.quotePath=false diff --name-only --cached 2>/dev/null; } | LC_ALL=C sort -u |
+            while IFS= read -r f; do owned "${f%%/*}" || printf ' %s' "$f"; done )"
+  [ -z "$stray" ] || die "refusing to commit files this project does not own:$stray
+  remove them, or add them to OWNED in ppx if they belong here"
+}
+
+cmd_ship() {
+  [ -d "$REPO/.git" ] || die "$REPO is not a git repository yet: ppx init"
+  [ $# -ge 1 ] || die 'usage: ppx ship "what changed"'
+  stray_check
+  g add -A
+  if g diff --cached --quiet; then
+    # nothing new; but commits a failed push left behind still go out
+    if g rev-parse -q --verify '@{u}' >/dev/null 2>&1 && [ -z "$(g rev-list '@{u}..HEAD' 2>/dev/null)" ]; then
+      say "nothing to commit"; return 0
+    fi
+  else
+    g commit -q -m "$*" || die "commit failed"
+  fi
+  g push -q -u origin HEAD || die "push failed - the commit is kept (GitHub has newer commits? ppx pull first); ppx ship again"
+  say "pushed $(g rev-parse --short HEAD) - the site publishes in a few minutes (ppx status)"
+}
+
+release_has_changes() {
+  # the failure this prevents: a stale build synced, version bumped, released.
+  last="$(g describe --tags --abbrev=0 2>/dev/null || true)"
+  [ -n "$last" ] || return 0
+  g diff --quiet "$last" -- . ':(exclude)src/version.ts' 2>/dev/null || return 0
+  [ -z "$(g status --porcelain --untracked-files=all -- . ':(exclude)src/version.ts' 2>/dev/null)" ] || return 0
+  old="$(g show "$last:src/version.ts" 2>/dev/null | grep -v '^export const APP_VERSION')"
+  new="$(grep -v '^export const APP_VERSION' "$REPO/src/version.ts")"
+  [ "$old" != "$new" ]
+}
+
+set_version() {
+  f="$REPO/src/version.ts"
+  sed "s/^export const APP_VERSION = \"[^\"]*\";/export const APP_VERSION = \"$1\";/" "$f" > "$f.new" && mv "$f.new" "$f"
+  [ "$(repo_ver)" = "$1" ]
+}
+
+release_notes() { printf '%s\n\nOpen it at %s' "$1" "$(site_url 2>/dev/null || echo 'the GitHub Pages site')"; }
+
+# push the branch and the tag, check GitHub has exactly this tag, then the GitHub release
+finish_release() {   # finish_release VERSION NOTES-GIVEN-NOW DEFAULT-NOTES
+  v="$1"; given="$2"; fallback="$3"
+  g push -q -u origin HEAD || die "push failed - nothing is lost (GitHub has newer commits? ppx pull first); run the same command again"
+  g push -q origin "refs/tags/v$v" || die "pushing tag v$v failed - run the same command again"
+  rt="$(remote_tag "$v")" || die "GitHub stopped answering before the tag could be checked - run the same command again"
+  [ "$rt" = "$(local_tag "$v")" ] || die "GitHub's tag v$v is not this release's (git ls-remote --tags origin)"
+  say "v$v is on GitHub"
+  if command -v gh >/dev/null 2>&1; then
+    slug="$(repo_slug)"
+    # the notes kept in the tag, so a release finished later still gets them
+    kept="$(g tag -l --format='%(contents:body)' "v$v" 2>/dev/null | sed '/^$/d')"
+    if gh_t release view "v$v" -R "$slug" >/dev/null 2>&1; then
+      if [ -n "$given" ]; then
+        gh_t release edit "v$v" --notes "$(release_notes "$given")" -R "$slug" >/dev/null 2>&1 && say "release v$v notes updated"
+      else
+        say "release v$v was already made"
+      fi
+    elif gh_t release create "v$v" --title "$NAME v$v" --notes "$(release_notes "${given:-${kept:-$fallback}}")" -R "$slug" >/dev/null 2>&1; then
+      say "release v$v created"
+    else
+      say "WARN: gh could not make the release (the tag is on GitHub; make the release on the web)"
+    fi
+    # the one-file version (works offline from a file), when this release built it
+    if [ -f "$REPO/dist/plastome-pixels.html" ] && [ "$REPO/dist/plastome-pixels.html" -nt "$REPO/src/version.ts" ]; then
+      gh_t release upload "v$v" "$REPO/dist/plastome-pixels.html" --clobber -R "$slug" >/dev/null 2>&1 \
+        && say "attached plastome-pixels.html (one file, works offline)"
+    fi
+  else
+    say "gh is not installed - the tag is on GitHub; make the release on the web"
+  fi
+  say "released v$v - the site publishes in a few minutes (ppx status)"
+}
+
+cmd_release() {
+  [ $# -ge 1 ] || die 'usage: ppx release <version> ["what changed"]'
+  v="$1"; shift
+  note="$*"
+  valid_ver "$v" || die "version must be digits and dots, e.g. 2.1"
+  [ -d "$REPO/.git" ] || die "$REPO is not a git repository yet: ppx init"
+  [ -n "$(repo_slug)" ] || die "no GitHub remote in $REPO: ppx init"
+  # GitHub decides what has been released: ask it first, before anything is pushed
+  rt="$(remote_tag "$v")" || die "GitHub can't be reached right now; nothing was changed. Try again with a connection."
+  lt="$(local_tag "$v")"
+  if [ -n "$lt" ] && [ "$(g rev-parse "v$v^{commit}")" = "$(g rev-parse HEAD)" ] && clean_tree \
+     && { [ -z "$rt" ] || [ "$rt" = "$lt" ]; }; then
+    say "finishing v$v"                      # tagged here already, nothing new since: push what's missing
+    finish_release "$v" "$note" "Genomes as columns of pixels."
+    return 0
+  fi
+  [ -z "$rt" ] || die "v$v is already released, and things changed since.
+  Release them as a new version: ppx release <next version>"
+  if [ -n "$lt" ]; then
+    say "tag v$v never reached GitHub: it moves to this release"
+  else
+    release_has_changes || die "refusing: nothing changed since the last release apart from the version.
+  A stale archive was probably synced. Download the current build and run ppx sync."
+  fi
+  stray_check
+  cur="$(repo_ver)"
+  was="$(cat "$REPO/src/version.ts")"
+  if [ "$cur" != "$v" ]; then
+    if newer "$cur" "$v" && [ "$FORCE" != "1" ]; then die "v$v is older than the current v$cur"; fi
+    set_version "$v" || die "version bump failed"
+    say "bumped $cur -> $v"
+  fi
+  if ! run_tests; then
+    printf '%s\n' "$was" > "$REPO/src/version.ts"
+    die "tests failed - nothing was committed${cur:+ (the version is back at $cur)}"
+  fi
+  g add -A
+  g diff --cached --quiet || g commit -q -m "v$v${note:+: $note}" || die "commit failed"
+  if [ -n "$note" ]; then g tag -f -a "v$v" -m "$NAME v$v" -m "$note" >/dev/null || die "tag failed"
+  else g tag -f -a "v$v" -m "$NAME v$v" >/dev/null || die "tag failed"; fi
+  finish_release "$v" "$note" "Genomes as columns of pixels."
+}
+
+cmd_web() {
+  need_gh
+  slug="$(repo_slug)"
+  [ -n "$slug" ] || die "no GitHub remote in $REPO: ppx init"
+  pages_on
+  if gh_t workflow run "$WORKFLOW" -R "$slug" >/dev/null 2>&1; then say "site build started"
+  else say "(start it by hand: Actions > pages > Run workflow)"; fi
+  say "in a few minutes: $(site_url)"
+}
+
+cmd_init() {   # first time: a git repository, a GitHub repository, Pages, and the first release
+  need_gh
+  [ -f "$REPO/src/version.ts" ] || die "no source in $REPO yet: download the archive, then ppx sync"
+  v="$(repo_ver)"; valid_ver "$v" || die "src/version.ts has no APP_VERSION"
+  name="${1:-PlastomePixels}"
+  if [ ! -d "$REPO/.git" ]; then
+    g init -q -b main 2>/dev/null || { g init -q && g checkout -q -b main; } || die "git init failed"
+    say "made a git repository in $REPO"
+  fi
+  if g rev-parse -q --verify HEAD >/dev/null; then
+    clean_tree || die "refusing: there are uncommitted changes. Commit them, or throw them away
+  (git checkout -- . && git clean -fd), and run ppx init again."
+  else
+    stray_check
+    g add -A
+    g commit -q -m "v$v" || die "commit failed (git config --global user.name / user.email?)"
+    g update-ref "$SYNCED" HEAD          # the files as extracted are the build
+  fi
+  if [ -z "$(repo_slug)" ]; then
+    (cd "$REPO" && gh repo create "$name" --public --source . --remote origin \
+      --description "Genomes as columns of pixels: one pixel per base, plus dominant-base window columns") >/dev/null \
+      || [ -n "$(repo_slug)" ] || die "gh repo create failed (is $name already taken? ppx init OtherName)"
+    say "github.com/$(repo_slug)"
+  fi
+  # set up once: when GitHub already has releases, this is not a first time
+  tags="$(g ls-remote --tags origin)" || die "GitHub can't be reached right now; try again with a connection."
+  others="$(printf '%s\n' "$tags" | awk '{ print $2 }' | grep -v -x -e "refs/tags/v$v" -e "refs/tags/v$v^{}" | grep . || true)"
+  [ -z "$others" ] || die "this repository is already set up and released. Use ppx release (or ppx web for Pages)."
+  if [ -n "$(local_tag "$v")" ]; then
+    [ "$(g rev-parse "v$v^{commit}")" = "$(g rev-parse HEAD)" ] || die "tag v$v is not on the current commit; use ppx release"
+  else
+    g tag -a "v$v" -m "$NAME v$v" -m "First release" || die "tag failed"
+  fi
+  rt="$(remote_tag "$v")" || die "GitHub can't be reached right now; try again with a connection."
+  [ -z "$rt" ] || [ "$rt" = "$(local_tag "$v")" ] || die "GitHub has a different v$v; use ppx release"
+  pages_on        # before the first push, so the publish it starts can deploy
+  finish_release "$v" "" "First release"
+}
+
+cmd_pull() {
+  [ -d "$REPO/.git" ] || die "$REPO is not a git repository"
+  g pull --ff-only || die "pull failed"
+  install_self
+}
+
+cmd_clean() {   # old and broken archives go; complete builds newer than the repo (not synced yet) stay
+  cur="$(repo_ver || true)"
+  n=0
+  for d in $DLS; do
+    for f in "$d"/plastomepixels-v*.tar.gz "$d"/plastomepixels-v*.tgz; do
+      [ -f "$f" ] || continue
+      v="$(tar_ver "$f")"
+      if archive_ok "$f" && valid_ver "$v" && { [ -z "$cur" ] || newer "$v" "$cur"; }; then
+        say "kept $(basename "$f"): v$v is not synced yet"; continue
+      fi
+      rm -f "$f" && n=$((n + 1))          # synced already, or not a build ppx would ever take
+    done
+  done
+  say "removed $n old download(s)"
+}
+
+cmd_pack() {   # the archive ppx sync takes: every file of the project that git would keep
+  dest="${1:-}"
+  if [ -z "$dest" ]; then for d in $DLS; do [ -d "$d" ] && { dest="$d"; break; }; done; fi
+  [ -n "$dest" ] || dest="$HOME"
+  [ -d "$dest" ] || die "no folder $dest"
+  dest="$(cd "$dest" && pwd)" || die "cannot use $dest"
+  root="$(cd "$REPO" && pwd)" || die "no project in $REPO"
+  case "$dest/" in "$root/"*) die "put the archive outside the project folder (it would end up in the next commit)" ;; esac
+  v="$(repo_ver)"; valid_ver "$v" || die "src/version.ts has no APP_VERSION"
+  tmpdir pack; tmp="$MKT"
+  # a throwaway git index reads .gitignore exactly as a commit would
+  git --git-dir="$tmp/g" init -q 2>/dev/null || die "git is needed"
+  (cd "$root" && git -c core.excludesFile=/dev/null -c core.quotePath=false --git-dir="$tmp/g" --work-tree=. \
+     ls-files --others --exclude-standard) > "$tmp/all" || die "listing failed"
+  while IFS= read -r f; do owned "${f%%/*}" && printf '%s\n' "$f"; done < "$tmp/all" > "$tmp/list"
+  for f in $CORE; do grep -qxF -- "$f" "$tmp/list" || die "the project is missing $f"; done
+  # the commit the build is made from (what GitHub had), so ppx sync can merge it into later work
+  if [ -d "$root/.git" ]; then
+    (cd "$root" && { git merge-base HEAD '@{u}' 2>/dev/null || git rev-parse -q --verify HEAD; }) > "$tmp/.ppx-base" 2>/dev/null
+    [ -s "$tmp/.ppx-base" ] || rm -f "$tmp/.ppx-base"
+  fi
+  out="$dest/plastomepixels-v$v.tar.gz"
+  if [ -f "$tmp/.ppx-base" ]; then tar czf "$out.new" -C "$root" -T "$tmp/list" -C "$tmp" .ppx-base || die "tar failed"
+  else tar czf "$out.new" -C "$root" -T "$tmp/list" || die "tar failed"; fi
+  mv "$out.new" "$out" || die "cannot write $out"
+  say "$(grep -c . "$tmp/list") files -> $out"
+}
+
+cmd_open() {
+  url="$(site_url)" || die "no GitHub remote yet: ppx init"
+  if command -v termux-open-url >/dev/null 2>&1; then termux-open-url "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1
+  elif command -v open >/dev/null 2>&1; then open "$url"
+  else printf '%s\n' "$url"; fi
+}
+
+usage() {
+  cat <<'EOF'
+ppx - Plastome Pixels: sync builds, test, publish on GitHub Pages
+
+  ppx status          repo / newest download / git, and what the live site serves
+  ppx sync            newest complete build (by the version inside) -> merged into the repo
+  ppx test            type-check, test and build (needs node: pkg install nodejs)
+  ppx ship "msg"      commit and push; the site publishes itself
+  ppx release <ver> ["what changed"]
+                      bump the version, test, commit, tag, push, GitHub release
+  ppx init [Name]     first time: git + a GitHub repository + Pages + the first release
+  ppx web             switch Pages on and start a publish
+  ppx open            open the live site
+  ppx pull            git pull, then update this command
+  ppx pack [dir]      make plastomepixels-v<version>.tar.gz (what ppx sync takes)
+  ppx clean           delete downloaded archives already synced
+  ppx version         the repo's version
+
+env: PPX_REPO (default ~/PlastomePixels)  PPX_DOWNLOADS (space-separated dirs)
+     PPX_FORCE=1 (go back a version; take a build that can't be merged)  PPX_NOFETCH=1  PPX_GH_REPO=owner/name
+EOF
+}
+
+c="${1:-}"
+[ $# -gt 0 ] && shift
+case "$c" in
+  status)  cmd_status ;;
+  sync)    cmd_sync ;;
+  test)    cmd_test ;;
+  ship)    cmd_ship "$@" ;;
+  release) cmd_release "$@" ;;
+  init)    cmd_init "$@" ;;
+  web)     cmd_web ;;
+  open)    cmd_open ;;
+  pull)    cmd_pull ;;
+  clean)   cmd_clean ;;
+  pack)    cmd_pack "$@" ;;
+  version|--version|-V) v="$(repo_ver)"; printf '%s\n' "${v:-unknown}" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
